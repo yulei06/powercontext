@@ -37,7 +37,7 @@ from uuid import uuid4
 from zoneinfo import ZoneInfo
 
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import func, select, update
+from sqlalchemy import case, func, select, update
 from sqlalchemy.ext.asyncio import AsyncConnection
 from typing_extensions import override
 
@@ -47,6 +47,7 @@ else:
     from multiprocessing.popen_spawn_posix import Popen as SpawnPopen
 
 from powercontext._logging import log_safely
+from powercontext.builtin.persistence.cursors import SourceCursorRepository
 from powercontext.builtin.persistence.database import AsyncDatabase
 from powercontext.builtin.persistence.errors import ArtifactProcessingLeadershipLostError
 from powercontext.builtin.persistence.processing_intents import ArtifactProcessingIntentRepository
@@ -57,7 +58,11 @@ from powercontext.builtin.persistence.supervision import (
     ArtifactProcessingLeaseRepository,
     database_utc_now,
 )
-from powercontext.builtin.persistence.tables import ARTIFACT_PROCESSING_INTENTS_TABLE, ARTIFACT_PROCESSING_LEASES_TABLE
+from powercontext.builtin.persistence.tables import (
+    ARTIFACT_PROCESSING_INTENTS_TABLE,
+    ARTIFACT_PROCESSING_LEASES_TABLE,
+    SOURCES_TABLE,
+)
 from powercontext.builtin.runtime.processing_contracts import (
     ArtifactProcessingWorkAssignment,
     ArtifactProcessingWorkerCompletion,
@@ -79,6 +84,7 @@ _DISCOVERY_PAGE_SIZE = 100
 _RETRY_STATE_LIMIT = 1000
 _CHANNEL_QUEUE_LIMIT = _DISCOVERY_PAGE_SIZE // 2
 _DISCOVERY_PAGE_DELAY_SECONDS = 0.01
+_COUNT_DISCOVERY_SECONDS = 0.2
 _DISCOVERY_TIMEOUT_SECONDS = 2.0
 _SPAWN_SIGTERM_GRACE_SECONDS = 1.0
 _WORKER_SHUTDOWN_TIMEOUT_SECONDS = 5.0
@@ -111,6 +117,7 @@ class ArtifactProcessingBinding:
     worker_timeout_seconds: float = 600.0
     automatic_processing_interval: timedelta | None = None
     cron: str | None = None
+    source_count_threshold: int | None = None
     timezone: str = "Asia/Shanghai"
     config_prefix: str | None = None
     pending_provider: ArtifactProcessingPendingProvider | None = None
@@ -138,6 +145,9 @@ class ArtifactProcessingBinding:
                 raise ValueError("interval and cron cannot both be enabled")  # noqa: TRY003
         if self.cron is not None:
             CronTrigger.from_crontab(self.cron, timezone=ZoneInfo(self.timezone))
+        threshold = self.source_count_threshold
+        if threshold is not None and (type(threshold) is not int or threshold < 1):
+            raise ValueError("source_count_threshold must be a positive integer")  # noqa: TRY003
 
 
 class _WorkerResultSender(Protocol):
@@ -392,6 +402,8 @@ class _FamilyState:
     running: dict[str, _RunningWorker] = field(default_factory=dict)
     retries: dict[str, _RetryState] = field(default_factory=dict)
     requested_after: int = 0
+    count_after: int = 0
+    count_check_at: float = 0.0
     scan_after: int = 0
     scan_generation: int = 0
     scan_in_progress: bool = False
@@ -448,6 +460,7 @@ class ArtifactProcessingSupervisor:
         self._intents = intents or ArtifactProcessingIntentRepository()
         self._leases = leases or ArtifactProcessingLeaseRepository()
         self._binding_states = binding_states or ArtifactProcessingBindingStateRepository()
+        self._cursors = SourceCursorRepository()
         self.holder_id = holder_id or str(uuid4())
         self._tick = oceanbase_tick_seconds
         self._lease_seconds = oceanbase_lease_seconds
@@ -651,11 +664,13 @@ class ArtifactProcessingSupervisor:
         # Alternate discovery channels so explicit traffic cannot monopolize admission.
         state.automatic_next = not state.automatic_next
         if state.automatic_next:
+            await self._discover_counted(state)
             await self._discover_automatic(state)
             await self._discover_requested(state)
         else:
             await self._discover_requested(state)
             await self._discover_automatic(state)
+            await self._discover_counted(state)
 
     async def _discover_requested(self, state: _FamilyState) -> None:
         capacity = self._fresh_capacity(state)
@@ -779,6 +794,52 @@ class ArtifactProcessingSupervisor:
         state.scan_in_progress = scan_in_progress
         state.next_schedule_at = next_schedule_at
         state.next_discovery_at = next_discovery_at
+        for scope in admitted:
+            self._enqueue(state, scope)
+
+    async def _discover_counted(self, state: _FamilyState) -> None:
+        """Accept one window when the pending journal identity count reaches its floor."""
+
+        binding = state.binding
+        threshold = binding.source_count_threshold
+        if threshold is None:
+            return
+        page = _DISCOVERY_PAGE_SIZE
+        capacity = self._fresh_capacity(state)
+        loop = asyncio.get_running_loop()
+        state.count_check_at = loop.time() + _COUNT_DISCOVERY_SECONDS
+        if capacity <= 0:
+            return
+        admitted: list[str] = []
+        after = state.count_after
+        async with self._database.transaction() as connection:
+            await self._leases.require_fence(connection, self._require_current_fence())
+            rows = await self._intents.scan(
+                connection, binding.binding_name, after_sequence=after, limit=page, dirty_only=True
+            )
+            candidates = [
+                row
+                for row in rows
+                if row.scope_id not in state.queued
+                and row.scope_id not in state.running
+                and row.scope_id not in state.retries
+                and row.requested_generation <= row.handled_generation
+            ]
+            scope_ids = [row.scope_id for row in candidates][:capacity]
+            counts: dict[str, int] = {}
+            if scope_ids:
+                stored = await self._cursors.load_many(connection, scope_ids, binding.binding_name)
+                floors = {scope: stored[scope].cursor.sequence if scope in stored else 0 for scope in scope_ids}
+                counts = await _pending_source_counts(connection, scope_ids, floors)
+                eligible = frozenset(scope for scope, count in counts.items() if count >= threshold)
+                if eligible and binding.automatic_scope_filter is not None:
+                    eligible &= await binding.automatic_scope_filter(connection, tuple(eligible))
+                for row in candidates:
+                    if row.scope_id not in eligible or len(admitted) >= capacity:
+                        continue
+                    await self._intents.accept(connection, row.scope_id, binding.binding_name)
+                    admitted.append(row.scope_id)
+        state.count_after = 0 if len(rows) < page else rows[-1].pending_sequence
         for scope in admitted:
             self._enqueue(state, scope)
 
@@ -1093,6 +1154,10 @@ class ArtifactProcessingSupervisor:
                 continue
             if state.next_schedule_at is not None:
                 deadlines.append(state.next_schedule_at)
+            if state.binding.source_count_threshold is not None:
+                # Count admission observes journal growth, which produces no
+                # notification of its own.
+                deadlines.append(max(now, state.count_check_at))
             if state.discovery_pending or state.scan_in_progress or not state.reconcile_complete or state.degraded:
                 deadlines.append(max(now, state.next_discovery_at))
         return None if not deadlines else max(0.001, min(deadlines) - now)
@@ -1132,6 +1197,24 @@ class ArtifactProcessingSupervisor:
                 else type(error).__name__,
             },
         )
+
+
+async def _pending_source_counts(
+    connection: AsyncConnection, scope_ids: Sequence[str], floors: dict[str, int]
+) -> dict[str, int]:
+    """Count the journal identities strictly after each Scope's committed cursor."""
+
+    if not scope_ids:
+        return {}
+    whens = [(SOURCES_TABLE.c.scope_id == scope, floor) for scope, floor in floors.items() if floor]
+    floor = case(*whens, else_=0) if whens else 0
+    rows = await connection.execute(
+        select(SOURCES_TABLE.c.scope_id, func.count())
+        .where(SOURCES_TABLE.c.scope_id.in_(tuple(scope_ids)), SOURCES_TABLE.c.journal_position > floor)
+        .group_by(SOURCES_TABLE.c.scope_id)
+    )
+    counts = {str(scope): int(total) for scope, total in rows.all()}
+    return {scope: counts.get(scope, 0) for scope in scope_ids}
 
 
 def _schedule_deadline(

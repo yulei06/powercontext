@@ -187,10 +187,16 @@ class NoMemoryIndex:
 
 
 class CompositeMemoryIndex:
-    """Combine independent search indexes without leaking them into repositories."""
+    """Combine independent search indexes without leaking them into repositories.
 
-    def __init__(self, *indexes: MemoryIndex) -> None:
+    ``hybrid`` is an optional strategy that answers a hybrid query with one native
+    statement over both projections. When it is absent, hybrid is served by calling the
+    single-channel indexes in turn, which is the historical behaviour.
+    """
+
+    def __init__(self, *indexes: MemoryIndex, hybrid: MemoryIndex | None = None) -> None:
         self.indexes = indexes
+        self._hybrid = hybrid
         fts = any(index.capabilities.fts for index in indexes)
         vector_indexes = tuple(index for index in indexes if index.capabilities.vector)
         profile = vector_indexes[0].capabilities.embedding_profile if vector_indexes else None
@@ -206,6 +212,8 @@ class CompositeMemoryIndex:
     async def initialize(self, connection: AsyncConnection, /) -> None:
         for index in self.indexes:
             await index.initialize(connection)
+        if self._hybrid is not None:
+            await self._hybrid.initialize(connection)
 
     async def replace(
         self,
@@ -247,6 +255,8 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid" and self._hybrid is not None:
+            return await self._hybrid.search(connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:

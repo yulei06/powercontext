@@ -17,6 +17,8 @@
 from __future__ import annotations
 
 import json
+import math
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -46,6 +48,14 @@ _MIN_TRUNCATED_CONTENT_BYTES = 64
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
+_FRAGMENT_SENTENCE = re.compile(r"[^.!?\n]+[.!?]?")
+_FRAGMENT_TOKEN = re.compile(r"[a-z]+|\d+")
+_FRAGMENT_MAX_CHARS = 420
+_FRAGMENT_QUERY_STOPWORDS = frozenset({
+    "a", "an", "the", "and", "or", "for", "of", "to", "in", "on", "at", "by", "from", "with",
+    "as", "is", "are", "was", "were", "be", "been", "this", "that", "these", "those", "it",
+    "its", "we", "our", "they", "their", "than", "then", "such", "can", "may", "not",
+})
 _Item = TypeVar("_Item")
 
 
@@ -93,6 +103,16 @@ class PreparedContextOmissions:
 
 
 @dataclass(frozen=True)
+class PreparedContextFragment:
+    """One literal character range chosen out of a Memory entry body."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
+
+
+@dataclass(frozen=True)
 class PreparedContextBuild:
     """Final public context and the exact origins selected to produce it.
 
@@ -106,6 +126,7 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedContextFragment, ...] = ()
 
 
 @dataclass(frozen=True)
@@ -235,6 +256,13 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
+        if request.evidence_selection:
+            return self._select_fragments(
+                request,
+                current_scope_id=current_scope_id,
+                memory_candidates=memory_candidates,
+            )
+
         content, origins, omissions = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
@@ -254,6 +282,30 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+        )
+
+    def _select_fragments(
+        self,
+        request: PrepareContextRequest,
+        *,
+        current_scope_id: str | None,
+        memory_candidates: Sequence[PreparedMemoryCandidates],
+    ) -> PreparedContextBuild:
+        """Choose literal character ranges of candidate Memory bodies for one query."""
+
+        chosen = _choose_fragments(
+            query=request.query,
+            max_bytes=request.max_bytes,
+            current_scope_id=current_scope_id,
+            memory_candidates=memory_candidates,
+        )
+        if not chosen:
+            return PreparedContextBuild(context=self.empty(), origins=())
+        content = _render_fragments(chosen)
+        return PreparedContextBuild(
+            context=PreparedContext(status="ready", content=content, content_bytes=len(content.encode("utf-8"))),
+            origins=tuple(_fragment_citation(fragment) for fragment in chosen),
+            fragments=chosen,
         )
 
     def probe_budget(
@@ -685,13 +737,150 @@ def _interleave_groups(groups: Sequence[Sequence[_Item]]) -> tuple[_Item, ...]:
     return tuple(ordered)
 
 
-def _render(entries: Sequence[_PreparedContextEntry]) -> str:
-    envelope = {
-        "trust": "untrusted_history",
-        "items": [_render_entry(entry) for entry in entries],
-    }
-    encoded = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+def _envelope(items: Sequence[dict[str, object]]) -> str:
+    encoded = json.dumps(
+        {"trust": "untrusted_history", "items": list(items)}, ensure_ascii=False, separators=(",", ":")
+    )
     return "\n\n".join((TRUST_POLICY, f"{_BEGIN_MARKER}\n{encoded}\n{_END_MARKER}"))
+
+
+def _render(entries: Sequence[_PreparedContextEntry]) -> str:
+    return _envelope([_render_entry(entry) for entry in entries])
+
+
+def _fragment_citation(fragment: PreparedContextFragment) -> MemoryCitation:
+    return MemoryCitation(
+        memory_ref=fragment.address.memory.artifact,
+        entry_id=fragment.address.entry_id,
+        entry_version_id=fragment.address.entry_version_id,
+    )
+
+
+def _render_fragments(fragments: Sequence[PreparedContextFragment]) -> str:
+    return _envelope(
+        [
+            {
+                "citation": {
+                    "scope_id": fragment.address.memory.scope_id,
+                    "memory_ref": fragment.address.memory.artifact.model_dump(mode="json"),
+                    "entry_id": fragment.address.entry_id,
+                    "entry_version_id": fragment.address.entry_version_id,
+                },
+                "content": fragment.text,
+                "start": fragment.start,
+                "end": fragment.end,
+            }
+            for fragment in fragments
+        ]
+    )
+
+
+def _tokens(text: str) -> list[str]:
+    return _FRAGMENT_TOKEN.findall(text.lower())
+
+
+def _query_terms(query: str) -> list[str]:
+    ordered: dict[str, None] = {}
+    for token in _tokens(query):
+        if len(token) > 1 or token.isdigit():
+            if token not in _FRAGMENT_QUERY_STOPWORDS:
+                ordered.setdefault(token, None)
+    return list(ordered)
+
+
+def _char_windows(text: str) -> list[tuple[int, int]]:
+    """Split one body into literal sentence windows without losing any character."""
+
+    spans: list[tuple[int, int]] = []
+    for match in _FRAGMENT_SENTENCE.finditer(text):
+        start, end = match.start(), match.end()
+        while end - start > _FRAGMENT_MAX_CHARS:
+            cut = text.rfind(" ", start + 1, start + _FRAGMENT_MAX_CHARS)
+            cut = start + _FRAGMENT_MAX_CHARS if cut <= start else cut
+            spans.append((start, cut))
+            start = cut + 1 if text[cut : cut + 1] == " " else cut
+        if end > start:
+            spans.append((start, end))
+    trimmed: list[tuple[int, int]] = []
+    for start, end in spans:
+        while start < end and text[start].isspace():
+            start += 1
+        while end > start and text[end - 1].isspace():
+            end -= 1
+        if end > start:
+            trimmed.append((start, end))
+    return trimmed
+
+
+def _choose_fragments(
+    *,
+    query: str,
+    max_bytes: int,
+    current_scope_id: str | None,
+    memory_candidates: Sequence[PreparedMemoryCandidates],
+) -> tuple[PreparedContextFragment, ...]:
+    """Rank literal windows by query evidence and pack them into the byte budget."""
+
+    terms = _query_terms(query)
+    pool: list[tuple[float, int, PreparedContextFragment, list[str]]] = []
+    index = 0
+    documents: list[str] = []
+    windows: list[tuple[int, list[str]]] = []
+    for candidates in memory_candidates:
+        scope_id = candidates.scope_id or current_scope_id
+        for hit in candidates.hits:
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=scope_id or "", artifact=candidates.memory_ref or hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+            documents.append(hit.text)
+            spans = _char_windows(hit.text)
+            for start, end in spans:
+                tokens = _tokens(hit.text[start:end])
+                pool.append((0.0, index, PreparedContextFragment(address, start, end, hit.text[start:end]), tokens))
+                windows.append((len(documents) - 1, tokens))
+                index += 1
+    if not pool:
+        return ()
+    total = len(pool)
+    frequency: dict[str, int] = {}
+    for _, _, _, tokens in pool:
+        for token in set(tokens):
+            frequency[token] = frequency.get(token, 0) + 1
+    weights = {
+        term: math.log(1.0 + (total - frequency.get(term, 0) + 0.5) / (frequency.get(term, 0) + 0.5)) for term in terms
+    }
+    mass = sum(weights.values()) or 1.0
+    bigrams = [f"{first} {second}" for first, second in zip(terms, terms[1:], strict=False)]
+    scored: list[tuple[float, int, PreparedContextFragment]] = []
+    for position, (_, order, fragment, tokens) in enumerate(pool):
+        present = set(tokens)
+        coverage = sum(weight for term, weight in weights.items() if term in present)
+        adjacency = 0
+        if bigrams:
+            glued = " ".join(tokens)
+            adjacency = sum(1 for bigram in bigrams if bigram in glued)
+        score = coverage / mass + 0.12 * adjacency
+        scored.append((score, order, fragment))
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    chosen: list[PreparedContextFragment] = []
+    used: dict[tuple[str, int], set[int]] = {}
+    for score, _, fragment in scored:
+        if score <= 0 and chosen:
+            break
+        identity = (fragment.address.entry_id, fragment.address.memory.artifact.revision)
+        occupied = used.setdefault(identity, set())
+        positions = range(fragment.start, fragment.end)
+        if any(position in occupied for position in positions):
+            continue
+        trial = [*chosen, fragment]
+        if len(_render_fragments(trial).encode("utf-8")) > max_bytes:
+            continue
+        chosen = trial
+        occupied.update(positions)
+    return tuple(chosen)
+
 
 
 def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:
