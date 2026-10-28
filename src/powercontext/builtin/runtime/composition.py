@@ -86,7 +86,6 @@ from powercontext.builtin.persistence.oceanbase.experience_index import OceanBas
 from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryFTSIndex,
     OceanBaseMemoryVectorIndex,
-    OceanBaseNativeHybridIndex,
 )
 from powercontext.builtin.persistence.oceanbase.profile import OceanBaseConfig, OceanBaseProfile
 from powercontext.builtin.persistence.oceanbase.topic_memory_index import (
@@ -969,11 +968,15 @@ async def open_builtin_contexts(
         return
     experience_index = OceanBaseExperienceFTSIndex()
     indexes = [OceanBaseMemoryFTSIndex()]
-    native_hybrid: MemoryIndex | None = None
     if embedding_model is not None:
         indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-        native_hybrid = OceanBaseNativeHybridIndex(embedding_model.profile)
-    index = CompositeMemoryIndex(*indexes, hybrid=native_hybrid)
+    # The single-statement hybrid candidate query stays available in
+    # ``OceanBaseNativeHybridIndex``, but the runtime keeps composing the two
+    # per-channel indexes. Fusing the same channels in the application layer is
+    # behaviourally identical, and it keeps the embedded engine on statements that
+    # are already proven on every deployment target: a custom statement that the
+    # engine rejects fatally would take the whole scope down instead of one search.
+    index = CompositeMemoryIndex(*indexes)
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))
