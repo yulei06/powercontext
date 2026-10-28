@@ -44,7 +44,7 @@ __all__ = [
 
 _IDENTITY_PREFIX = "pdf:"
 _TERM = re.compile(r"[a-z]+|\d+")
-_MAX_POOL = 640
+_MAX_POOL = 160
 _QUERY_STOPWORDS = frozenset({
     "a", "an", "the", "and", "or", "for", "of", "to", "in", "on", "at", "by", "from", "with",
     "as", "is", "are", "was", "were", "be", "been", "being", "what", "which", "who", "how",
@@ -213,19 +213,19 @@ def _query_plan(question: str) -> tuple[tuple[str, int], ...]:
     """Plan high-precision and high-recall lexical queries with per-query caps."""
 
     terms = _content_terms(question)
-    plan: list[tuple[str, int]] = [(question, 120)]
+    # Two coarse queries carry the bulk of the evidence and the sliding windows only
+    # rescue questions whose terms sit far apart. Every extra query costs a full
+    # candidate hydration pass, and the budget has to hold for whole filing sets, so
+    # the plan stays deliberately short.
+    plan: list[tuple[str, int]] = [(question, 80)]
     if terms:
-        plan.append((" ".join(terms), 120))
-    # Overlapping windows keep content terms reachable under the coverage floor.
-    for index in range(0, max(0, len(terms) - 3), 3):
+        plan.append((" ".join(terms), 80))
+    for index in range(0, max(0, len(terms) - 3), 4):
         window = " ".join(terms[index : index + 4])
         if window:
-            plan.append((window, 60))
-        if len(plan) >= 6:
+            plan.append((window, 40))
+        if len(plan) >= 4:
             break
-    # Single-term queries bypass the coverage floor so rare vocabulary still surfaces.
-    for term in terms[:14]:
-        plan.append((term, 24))
     return tuple(plan)
 
 
